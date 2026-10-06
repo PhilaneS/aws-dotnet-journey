@@ -2,6 +2,8 @@ using System.Collections.Concurrent;
 using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
+using CloudDocumentService.Contracts;
+using CloudDocumentService.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -30,6 +32,7 @@ builder.Services.AddSingleton<IAmazonS3>(_ =>
         config);
 });
 
+builder.Services.AddScoped<IDocumentStorage, S3DocumentStorage>();
 
 var app = builder.Build();
 
@@ -67,37 +70,74 @@ app.MapPost("/documents", (CreateDocument request) =>
     return Results.Created($"/documents/{document.Id}", document);
 });
 app.MapPost("/documents/upload",
-    async (IFormFile file, IAmazonS3 s3) =>
-{
-    if (file.Length == 0)
-        return Results.BadRequest("File is empty.");
-
-    var key = $"uploads/{Guid.NewGuid()}/{Path.GetFileName(file.FileName)}";
-
-    await using var stream = file.OpenReadStream();
-
-    await s3.PutObjectAsync(new PutObjectRequest
+    async (
+        IFormFile file,
+        IDocumentStorage storage,
+        CancellationToken cancellationToken) =>
     {
-        BucketName = "documents",
-        Key = key,
-        InputStream = stream,
-        ContentType = file.ContentType
-    });
+        if (file.Length == 0)
+            return Results.BadRequest("File is empty.");
 
-    return Results.Ok(new
+        await using var stream = file.OpenReadStream();
+
+        var key = await storage.UploadAsync(
+            stream,
+            file.FileName,
+            file.ContentType,
+            cancellationToken);
+
+        return Results.Ok(new
+        {
+            FileName = file.FileName,
+            Bucket = "documents",
+            Key = key
+        });
+    })
+    .DisableAntiforgery();
+    
+app.MapGet("/documents/download",
+    async (
+        string key,
+        IDocumentStorage storage,
+        CancellationToken cancellationToken) =>
     {
-        FileName = file.FileName,
-        Bucket = "documents",
-        Key = key
-    });
-})
-.DisableAntiforgery();
+        if (string.IsNullOrWhiteSpace(key))
+            return Results.BadRequest("Object key is required.");
 
+        try
+        {
+            var stream = await storage.DownloadAsync(
+                key,
+                cancellationToken);
+
+            return Results.File(
+                stream,
+                "application/octet-stream",
+                Path.GetFileName(key));
+        }
+        catch (AmazonS3Exception ex)
+            when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            return Results.NotFound("File not found.");
+        }
+    });
 app.MapDelete("/documents/{id:guid}", (Guid id) =>
     documents.TryRemove(id, out _)
         ? Results.NoContent()
         : Results.NotFound());
+app.MapDelete("/documents/storage",
+    async (
+        string key,
+        IDocumentStorage storage,
+        CancellationToken cancellationToken) =>
+    {
+        if (string.IsNullOrWhiteSpace(key))
+            return Results.BadRequest("Object key is required.");
 
+        await storage.DeleteAsync(key, cancellationToken);
+
+        return Results.NoContent();
+    });
 app.Run();
 
 record CreateDocument(string FileName);
